@@ -15,17 +15,17 @@ MODEL_DIR = "./distilgpt2_local"
 CSV_PATH = "wikitext_small.csv"
 SAVE_DIR = "./distilgpt2_finetuned"
 
-EPOCHS = 10
+EPOCHS = 20
 BATCH_SIZE = 4
 MAX_SEQ_LEN = 16
 NUM_SHARDS = 5
 
 SHARD_ADDRS = {
-    0: ("192.168.1.45", 9000),
-    1: ("192.168.1.45", 9001),
-    2: ("192.168.1.45", 9002),
-    3: ("192.168.1.45", 9003),
-    4: ("192.168.1.45", 9004),
+    0: ("192.168.1.47", 9000),
+    1: ("192.168.1.47", 9001),
+    2: ("192.168.1.48", 9002),
+    3: ("192.168.1.48", 9003),
+    4: ("192.168.1.48", 9004),
 }
 
 def log_memory_usage(note=""):
@@ -57,43 +57,64 @@ optimizer = optim.Adam(list(ln_f.parameters()) + list(lm_head.parameters()), lr=
 loss_fn = nn.CrossEntropyLoss()
 training_log = []
 
-def save_shard_weights():
+# === Initialize shard connections ===
+shard_sockets = {}
+def connect_shards():
     for shard_id in range(NUM_SHARDS):
         ip, port = SHARD_ADDRS[shard_id]
         try:
-            with socket.create_connection((ip, port), timeout=10) as sock:
+            sock = socket.create_connection((ip, port), timeout=10)
+            shard_sockets[shard_id] = sock
+            print(f"[shard {shard_id}] Connected")
+        except Exception as e:
+            print(f"[shard {shard_id}] Connection error: {e}")
+            shard_sockets[shard_id] = None
+
+def close_shards():
+    for shard_id, sock in shard_sockets.items():
+        if sock:
+            sock.close()
+            print(f"[shard {shard_id}] Closed")
+
+def save_shard_weights():
+    for shard_id, sock in shard_sockets.items():
+        if sock:
+            try:
                 print(f"[to shard {shard_id}] Sending save command")
                 sock.send(b"save")
                 ack = sock.recv(2)
                 if ack == b"OK":
                     print(f"[from shard {shard_id}] Save acknowledged")
-        except Exception as e:
-            print(f"[shard {shard_id}] Save failed: {e}")
+            except Exception as e:
+                print(f"[shard {shard_id}] Save failed: {e}")
 
 def run_shard(shard_id, tensor=None, grad=None):
-    ip, port = SHARD_ADDRS[shard_id]
+    sock = shard_sockets.get(shard_id)
+    if not sock:
+        print(f"[shard {shard_id}] No connection")
+        return torch.zeros_like(tensor if tensor is not None else grad)
     try:
         if tensor is not None:
-            with socket.create_connection((ip, port), timeout=10) as sock:
-                print(f"[to shard {shard_id}] Sending tensor, shape: {list(tensor.shape)}")
-                sock.send(b"data")
-                send_tensor(sock, tensor.cpu())
-                result = recv_tensor(sock)
-                print(f"[from shard {shard_id}] Received result, shape: {list(result.shape)}")
-                return result
+            print(f"[to shard {shard_id}] Sending tensor, shape: {list(tensor.shape)}")
+            sock.send(b"data")
+            send_tensor(sock, tensor.cpu())
+            result = recv_tensor(sock)
+            print(f"[from shard {shard_id}] Received result, shape: {list(result.shape)}")
+            return result
         elif grad is not None:
-            with socket.create_connection((ip, port), timeout=10) as sock:
-                print(f"[to shard {shard_id}] Sending gradient, shape: {list(grad.shape)}")
-                sock.send(b"grad")
-                send_tensor(sock, grad.cpu())
-                result = recv_tensor(sock)
-                print(f"[from shard {shard_id}] Received backward gradient, shape: {list(result.shape)}")
-                return result
+            print(f"[to shard {shard_id}] Sending gradient, shape: {list(grad.shape)}")
+            sock.send(b"grad")
+            send_tensor(sock, grad.cpu())
+            result = recv_tensor(sock)
+            print(f"[from shard {shard_id}] Received backward gradient, shape: {list(result.shape)}")
+            return result
     except Exception as e:
         print(f"[shard {shard_id}] Communication error: {e}")
         return torch.zeros_like(tensor if tensor is not None else grad)
 
 model.train()
+connect_shards()
+
 for epoch in range(EPOCHS):
     print(f"\nEpoch {epoch + 1}/{EPOCHS}")
     start_time = time.time()
@@ -155,6 +176,7 @@ for epoch in range(EPOCHS):
 
     save_shard_weights()
 
+close_shards()
 model.save_pretrained(SAVE_DIR)
 tokenizer.save_pretrained(SAVE_DIR)
 print(f"Model and tokenizer saved to {SAVE_DIR}")
